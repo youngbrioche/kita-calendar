@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["format_version", "calendar_name", "exported_at", "events"],
+  "properties": {
+    "format_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$",
+      "description": "The version of the calendar format"
+    },
+    "calendar_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Name of the calendar"
+    },
+    "exported_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Timestamp when the calendar was exported"
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "start_date", "end_date", "all_day"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Name of the event"
+          },
+          "start_date": {
+            "type": "string",
+            "format": "date",
+            "description": "Start date of the event in YYYY-MM-DD format"
+          },
+          "end_date": {
+            "type": "string",
+            "format": "date",
+            "description": "End date of the event in YYYY-MM-DD format"
+          },
+          "all_day": {
+            "type": "boolean",
+            "description": "Whether the event is an all-day event"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
