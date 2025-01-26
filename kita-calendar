@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "click",
+#     "icalendar",
+#     "python-dateutil",
+# ]
+# ///
+
+import sqlite3
+import icalendar
+import datetime
+from dateutil import parser
+import click
+import sys
+import json
+
+def init_db():
+    """Initialize SQLite database with required table"""
+    conn = sqlite3.connect('kita_events.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS events
+                 (id INTEGER PRIMARY KEY,
+                  summary TEXT NOT NULL,
+                  start_date TEXT NOT NULL,
+                  end_date TEXT NOT NULL,
+                  all_day BOOLEAN NOT NULL,
+                  event_identifier TEXT NOT NULL,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE INDEX IF NOT EXISTS idx_event_identifier 
+                 ON events(event_identifier, start_date, end_date)''')
+    conn.commit()
+    conn.close()
+
+def generate_event_identifier(summary, start_date, end_date):
+    """Generate a consistent identifier for event duplicate checking"""
+    base_summary = summary.split('–')[0].strip()
+    return f"{base_summary}_{start_date}_{end_date}"
+
+def is_duplicate(event_identifier, start_date, end_date):
+    """Check if an event with the same identifier and dates exists"""
+    conn = sqlite3.connect('kita_events.db')
+    c = conn.cursor()
+    c.execute('''SELECT COUNT(*) FROM events 
+                 WHERE event_identifier = ? 
+                 AND start_date = ? 
+                 AND end_date = ?''',
+              (event_identifier, start_date, end_date))
+    count = c.fetchone()[0]
+    conn.close()
+    return count > 0
+
+def add_event(summary, start_date, end_date, all_day=True):
+    """Add a new event to the database with duplicate checking"""
+    event_identifier = generate_event_identifier(summary, start_date, end_date)
+    
+    if is_duplicate(event_identifier, start_date, end_date):
+        raise ValueError(f"Duplicate event detected: {summary} from {start_date} to {end_date}")
+    
+    conn = sqlite3.connect('kita_events.db')
+    c = conn.cursor()
+    try:
+        c.execute('''INSERT INTO events 
+                     (summary, start_date, end_date, all_day, event_identifier)
+                     VALUES (?, ?, ?, ?, ?)''',
+                  (summary, start_date, end_date, all_day, event_identifier))
+        conn.commit()
+        return True
+    except sqlite3.Error as e:
+        click.echo(f"Error adding event: {e}", err=True)
+        return False
+    finally:
+        conn.close()
+
+def export_calendar(output_file):
+    """Export all events from the database to an ICS file"""
+    cal = icalendar.Calendar()
+    cal.add('prodid', '-//Krippe Kita-Zentrum Bad Wiessee Kalender//DE')
+    cal.add('version', '2.0')
+    cal.add('calscale', 'GREGORIAN')
+    
+    conn = sqlite3.connect('kita_events.db')
+    c = conn.cursor()
+    
+    try:
+        for row in c.execute('SELECT * FROM events ORDER BY start_date'):
+            event = icalendar.Event()
+            event.add('summary', row[1])
+            
+            if row[4]:  # all_day event
+                event.add('dtstart', parser.parse(row[2]).date())
+                event.add('dtend', parser.parse(row[3]).date())
+            else:
+                event.add('dtstart', parser.parse(row[2]))
+                event.add('dtend', parser.parse(row[3]))
+                
+            event.add('dtstamp', datetime.datetime.now())
+            cal.add_component(event)
+        
+        with open(output_file, 'wb') as f:
+            f.write(cal.to_ical())
+        click.echo(f"Calendar exported successfully to {output_file}")
+        
+    except Exception as e:
+        click.echo(f"Error exporting calendar: {e}", err=True)
+        sys.exit(1)
+    finally:
+        conn.close()
+
+def export_to_json(output_file):
+    """Export all events to a JSON file"""
+    conn = sqlite3.connect('kita_events.db')
+    c = conn.cursor()
+    
+    events = []
+    for row in c.execute('SELECT summary, start_date, end_date, all_day FROM events ORDER BY start_date'):
+        events.append({
+            "name": row[0],
+            "start_date": row[1],
+            "end_date": row[2],
+            "all_day": bool(row[3])
+        })
+    
+    conn.close()
+    
+    event_count = len(events)
+    calendar_data = {
+        "format_version": "1.0",
+        "calendar_name": "Kita Maria Himmelfahrt",
+        "exported_at": datetime.datetime.now().isoformat(),
+        "events": events
+    }
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(calendar_data, f, indent=2, ensure_ascii=False)
+    
+    click.echo(f"Calendar exported successfully to {output_file} ({event_count} events)")
+
+def import_from_json(input_file):
+    """Import events from a JSON file"""
+    with open(input_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    if "format_version" not in data or "events" not in data:
+        raise ValueError("Invalid calendar JSON format")
+    
+    success_count = 0
+    skip_count = 0
+    
+    for event in data["events"]:
+        try:
+            add_event(
+                event["name"],
+                event["start_date"],
+                event["end_date"],
+                event.get("all_day", True)
+            )
+            success_count += 1
+        except ValueError:
+            skip_count += 1
+            continue
+    
+    return success_count, skip_count
+
+@click.group(context_settings=dict(help_option_names=['-h', '--help']))
+def cli():
+    """Kita Calendar Management Tool"""
+    init_db()
+
+@cli.command()
+@click.option('--name', '-n', required=True, help='Event name and description')
+@click.option('--start', '-s', required=True, help='Start date (YYYY-MM-DD)')
+@click.option('--end', '-e', required=True, help='End date (YYYY-MM-DD)')
+@click.option('--partial-day', '-p', is_flag=True, help='Specify if event is not all-day')
+def add_event(name, start, end, partial_day):
+    """Add a new event to the calendar."""
+    try:
+        add_event_to_db(name, start, end, not partial_day)
+        click.echo("Event added successfully")
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+def import_from_json(input_file):
+    """Import events from a JSON file"""
+    with open(input_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    if "format_version" not in data or "events" not in data:
+        raise ValueError("Invalid calendar JSON format")
+    
+    success_count = 0
+    skip_count = 0
+    
+    for event in data["events"]:
+        try:
+            add_event_to_db(
+                event["name"],
+                event["start_date"],
+                event["end_date"],
+                event.get("all_day", True)
+            )
+            success_count += 1
+        except ValueError:
+            skip_count += 1
+            continue
+    
+    return success_count, skip_count
+
+def add_event_to_db(summary, start_date, end_date, all_day=True):
+    """Add a new event to the database with duplicate checking"""
+    event_identifier = generate_event_identifier(summary, start_date, end_date)
+    
+    if is_duplicate(event_identifier, start_date, end_date):
+        raise ValueError(f"Duplicate event detected: {summary} from {start_date} to {end_date}")
+    
+    conn = sqlite3.connect('kita_events.db')
+    c = conn.cursor()
+    try:
+        c.execute('''INSERT INTO events 
+                     (summary, start_date, end_date, all_day, event_identifier)
+                     VALUES (?, ?, ?, ?, ?)''',
+                  (summary, start_date, end_date, all_day, event_identifier))
+        conn.commit()
+        return True
+    except sqlite3.Error as e:
+        click.echo(f"Error adding event: {e}", err=True)
+        return False
+    finally:
+        conn.close()
+
+@cli.command()
+@click.option('--output', '-o', required=True, 
+              type=click.Path(dir_okay=False, writable=True),
+              help='Output ICS file path')
+def export(output):
+    """Export calendar to ICS file.
+    
+    Creates a static ICS file that can be hosted on a web server for calendar
+    subscriptions.
+
+    Example:
+    \b
+    uv run kita-calendar.py export --output calendar.ics
+    """
+    export_calendar(output)
+
+@cli.command()
+@click.option('--output', '-o', required=True, 
+              type=click.Path(dir_okay=False, writable=True),
+              help='Output JSON file path')
+def export_json(output):
+    """Export calendar to JSON format.
+    
+    Creates a JSON file containing all calendar events. This format is suitable
+    for backup purposes or transferring events between calendars.
+
+    Example:
+    \b
+    uv run kita-calendar.py export-json --output calendar-backup.json
+    """
+    export_to_json(output)
+
+@cli.command()
+@click.option('--input', '-i', required=True, 
+              type=click.Path(exists=True, dir_okay=False),
+              help='Input JSON file path')
+def import_json(input):
+    """Import calendar events from JSON format.
+    
+    Imports events from a JSON file. Duplicate events are skipped automatically.
+
+    Example:
+    \b
+    uv run kita-calendar.py import-json --input calendar-backup.json
+    """
+    try:
+        success, skipped = import_from_json(input)
+        click.echo(f"Successfully imported {success} events, skipped {skipped} duplicates")
+    except (ValueError, KeyError) as e:
+        click.echo(f"Error importing events: {e}", err=True)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    cli()
